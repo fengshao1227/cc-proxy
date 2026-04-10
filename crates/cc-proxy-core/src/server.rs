@@ -78,7 +78,10 @@ pub async fn serve(config: ProxyConfig) -> Result<(), ProxyError> {
 
     let listener = TcpListener::bind(&addr)
         .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to bind {addr}: {e}")))?;
+        .map_err(|source| ProxyError::BindFailed {
+            addr: addr.clone(),
+            source,
+        })?;
 
     // Graceful shutdown on SIGTERM/SIGINT (F32)
     let shutdown = async {

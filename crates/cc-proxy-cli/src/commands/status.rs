@@ -2,6 +2,7 @@ use anyhow::Result;
 use cc_proxy_core::config::ProxyConfig;
 
 use crate::daemon::read_pid;
+use crate::diagnostics::{diagnose_port, print_diagnosis, PortDiagnosis};
 
 /// 加载配置：优先 config.json，其次 env/.env
 fn load_config() -> Result<ProxyConfig> {
@@ -120,7 +121,30 @@ pub async fn run() -> Result<()> {
                     if let Some(pid) = read_pid() {
                         println!("  (发现残留 PID 文件，记录 PID: {pid}，进程可能已异常退出)");
                     }
-                    println!("  提示: 使用 `cc-proxy start` 启动代理服务");
+
+                    // 主动诊断端口：未运行的真正原因可能是端口被系统保留
+                    let diagnosis = diagnose_port(port);
+                    match &diagnosis {
+                        PortDiagnosis::WindowsReserved { .. } => {
+                            println!();
+                            print_diagnosis(&diagnosis);
+                        }
+                        PortDiagnosis::HeldByProcess {
+                            pid: holder, name, ..
+                        } => {
+                            // 如果占用者就是自己的残留进程，不重复提示
+                            if read_pid() != Some(*holder) {
+                                println!();
+                                println!("  ⚠ 端口 {port} 被其他进程占用: PID {holder} ({name})");
+                                println!("    提示: 终止该进程或运行 `cc-proxy doctor` 查看详情");
+                            } else {
+                                println!("  提示: 使用 `cc-proxy start` 启动代理服务");
+                            }
+                        }
+                        PortDiagnosis::Unknown { .. } => {
+                            println!("  提示: 使用 `cc-proxy start` 启动代理服务");
+                        }
+                    }
                 }
             }
         }

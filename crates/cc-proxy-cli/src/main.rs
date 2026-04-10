@@ -5,6 +5,7 @@ use dialoguer::Select;
 mod claude_config;
 mod commands;
 mod daemon;
+mod diagnostics;
 
 #[derive(Parser)]
 #[command(name = "cc-proxy")]
@@ -31,6 +32,12 @@ enum Commands {
     Setup,
     /// Test upstream API connection
     Test,
+    /// Diagnose port / config / process issues (use --fix on Windows for one-click repair)
+    Doctor {
+        /// Auto-fix Windows port reservation (requires admin elevation via UAC)
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 Commands::Status => commands::status::run().await?,
                 Commands::Setup => commands::setup::run().await?,
                 Commands::Test => commands::test::run().await?,
+                Commands::Doctor { fix } => commands::doctor::run(fix).await?,
             }
         }
         None => interactive_menu().await?,
@@ -144,6 +152,9 @@ async fn interactive_menu() -> anyhow::Result<()> {
             items.push(mi("🔗", "测试连接", "测试上游 API"));
             actions.push("test");
 
+            items.push(mi("🩺", "体检修复", "诊断端口/进程/配置问题"));
+            actions.push("doctor");
+
             if proxy_running {
                 items.push(mi("⏹", "停止代理", ""));
                 actions.push("stop");
@@ -205,6 +216,22 @@ async fn interactive_menu() -> anyhow::Result<()> {
             }
             "test" => {
                 commands::test::run().await?;
+            }
+            "doctor" => {
+                commands::doctor::run(false).await?;
+                // 在菜单里发现问题时，询问是否立即修复（仅 Windows）
+                #[cfg(target_os = "windows")]
+                {
+                    use dialoguer::Confirm;
+                    let fix = Confirm::new()
+                        .with_prompt("  是否立即运行 doctor --fix 一键修复？")
+                        .default(true)
+                        .interact()
+                        .unwrap_or(false);
+                    if fix {
+                        commands::doctor::run(true).await?;
+                    }
+                }
             }
             "stop" => {
                 commands::stop::run()?;

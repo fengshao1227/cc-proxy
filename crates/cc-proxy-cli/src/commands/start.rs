@@ -1,5 +1,8 @@
 use anyhow::Result;
 use cc_proxy_core::config::ProxyConfig;
+use cc_proxy_core::error::ProxyError;
+
+use crate::diagnostics;
 
 pub async fn run() -> Result<()> {
     let config = load_config()?;
@@ -33,7 +36,15 @@ pub async fn run() -> Result<()> {
     );
     println!();
 
-    cc_proxy_core::server::serve(config).await?;
+    let port = config.port;
+    if let Err(e) = cc_proxy_core::server::serve(config).await {
+        if let ProxyError::BindFailed { addr, source } = &e {
+            diagnostics::print_bind_failure_advice(addr, port, source);
+            // 友好失败，避免再 panic 一遍 io::Error 信息
+            std::process::exit(1);
+        }
+        return Err(e.into());
+    }
     Ok(())
 }
 

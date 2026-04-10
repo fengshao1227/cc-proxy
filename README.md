@@ -88,6 +88,8 @@ Running `cc-proxy` without arguments enters the interactive menu:
 | `cc-proxy stop` | Stop daemon |
 | `cc-proxy status` | Show config and status |
 | `cc-proxy test` | Test upstream API |
+| `cc-proxy doctor` | Diagnose port / config / process |
+| `cc-proxy doctor --fix` | **Windows: one-click fix port reservation** (UAC) |
 
 ## Configuration
 
@@ -130,6 +132,41 @@ SMALL (haiku)  → gpt-5.4-mini reasoning: none
 | `SMALL_REASONING` | `none` | Reasoning for haiku tier |
 | `PORT` | `8082` | Server port |
 | `ANTHROPIC_API_KEY` | *(none)* | Client auth key |
+
+## FAQ
+
+**Windows: after rebooting, `cc-proxy start` fails with `Only one usage of each socket address (protocol/network address/port) is normally permitted` (error 10048)?**
+
+Not a cc-proxy bug, your config is intact, **you don't need to change the port**.
+
+Real cause: on Windows, Hyper-V / WSL2 / Docker Desktop reserve a slice of TCP ports through the `winnat` service. **The reservation range shifts every reboot** — this time it happened to grab 8082. Once it does:
+- Any user-mode program fails to bind (WSAEADDRINUSE 10048)
+- `netstat` shows nothing listening on the port
+- `cc-proxy /health` probe also fails → looks like "not running"
+
+**One-click permanent fix** (v0.2.2+):
+
+```bash
+cc-proxy doctor --fix
+```
+
+Triggers UAC elevation, then permanently adds 8082 to Windows' excluded port range (`net stop winnat` → `netsh add excludedportrange` → `net start winnat`). After this, **rebooting will not bring the issue back**.
+
+Note: `net stop winnat` briefly interrupts Docker/WSL2 networking (~3 seconds).
+
+**Want to inspect first?**
+
+```bash
+cc-proxy doctor
+```
+
+Health-check mode prints config / process / port diagnosis, lists the top 10 Windows reserved port ranges, and highlights the one containing your port with `◀ HIT`.
+
+**`model not exist` error from Claude Code**
+→ Check that the proxy is running (`cc-proxy` → status) and `ANTHROPIC_API_KEY` matches the proxy's auth key.
+
+**Auth conflict error**
+→ Add `ANTHROPIC_AUTH_TOKEN=""` to force the API-key path instead of the claude.ai login.
 
 ## Community
 

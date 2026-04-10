@@ -25,6 +25,13 @@ pub enum ProxyError {
     #[error("Client disconnected")]
     ClientDisconnected,
 
+    #[error("Failed to bind {addr}: {source}")]
+    BindFailed {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     Internal(String),
 }
