@@ -7,7 +7,8 @@
 use tiktoken_rs::o200k_base;
 
 use crate::types::claude::{
-    ContentBlock, MessageContent, MessagesRequest, SystemContent, ToolResultContent,
+    ContentBlock, Message, MessageContent, MessagesRequest, SystemContent, TokenCountRequest,
+    Tool, ToolResultContent,
 };
 
 /// Count input tokens for a Claude Messages API request using tiktoken BPE.
@@ -15,6 +16,36 @@ use crate::types::claude::{
 /// Extracts all text content from system prompt, messages, and tool definitions,
 /// then counts tokens with the o200k_base tokenizer (GPT-4o / GPT-5 family).
 pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
+    count_tokens_from_parts(
+        request.system.as_ref(),
+        &request.messages,
+        request.tools.as_deref(),
+    )
+}
+
+/// Count tokens for a `/v1/messages/count_tokens` request body.
+///
+/// Uses the same underlying logic as `count_request_tokens` so that the
+/// number returned by the count_tokens endpoint matches the usage reported
+/// after an actual completion. This keeps Claude Code's context meter and
+/// its pre-flight "tokens remaining" estimate aligned with reality.
+pub fn count_token_count_request(request: &TokenCountRequest) -> u32 {
+    count_tokens_from_parts(
+        request.system.as_ref(),
+        &request.messages,
+        request.tools.as_deref(),
+    )
+}
+
+/// Shared core: count tokens across system + messages + tools using o200k_base.
+///
+/// The signature takes references so both `MessagesRequest` and
+/// `TokenCountRequest` can feed their fields in without allocation.
+fn count_tokens_from_parts(
+    system: Option<&SystemContent>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+) -> u32 {
     let bpe = match o200k_base() {
         Ok(bpe) => bpe,
         Err(_) => {
@@ -26,7 +57,7 @@ pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
     let mut segments: Vec<&str> = Vec::with_capacity(64);
 
     // System prompt
-    if let Some(ref system) = request.system {
+    if let Some(system) = system {
         match system {
             SystemContent::Text(s) => segments.push(s),
             SystemContent::Blocks(blocks) => {
@@ -40,7 +71,7 @@ pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
     }
 
     // Messages
-    for msg in &request.messages {
+    for msg in messages {
         // Role token overhead (~1 token per message)
         segments.push(&msg.role);
         match &msg.content {
@@ -71,7 +102,7 @@ pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
     let mut owned_segments: Vec<String> = Vec::new();
 
     // Tool use inputs from messages
-    for msg in &request.messages {
+    for msg in messages {
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 if let ContentBlock::ToolUse { input, .. } = block {
@@ -98,7 +129,7 @@ pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
     }
 
     // Tool definitions
-    if let Some(ref tools) = request.tools {
+    if let Some(tools) = tools {
         for tool in tools {
             owned_segments.push(tool.name.clone());
             if let Some(ref desc) = tool.description {
@@ -119,7 +150,7 @@ pub fn count_request_tokens(request: &MessagesRequest) -> u32 {
     let tokens = bpe.encode_with_special_tokens(&all_text);
 
     // Add per-message overhead (~4 tokens per message for role/formatting)
-    let overhead = (request.messages.len() as u32) * 4;
+    let overhead = (messages.len() as u32) * 4;
 
     (tokens.len() as u32) + overhead
 }

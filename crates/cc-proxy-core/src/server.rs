@@ -16,7 +16,7 @@ use crate::client::UpstreamClient;
 use crate::config::ProxyConfig;
 use crate::convert;
 use crate::error::ProxyError;
-use crate::types::claude::{MessageContent, MessagesRequest, SystemContent, TokenCountRequest};
+use crate::types::claude::{MessagesRequest, TokenCountRequest};
 
 /// Shared application state
 #[derive(Clone)]
@@ -29,12 +29,16 @@ pub struct AppState {
 pub fn create_router(state: AppState) -> Router {
     let auth_key = state.config.anthropic_api_key.clone();
 
-    // Authenticated routes (Claude API endpoints)
-    // NOTE: count_tokens intentionally NOT registered — let Claude Code
-    // fall back to its own internal tokenizer (more accurate than any
-    // proxy-side estimate). cc-switch also omits this endpoint.
+    // Authenticated routes (Claude API endpoints).
+    //
+    // count_tokens is registered and uses tiktoken o200k_base — the same
+    // family OpenAI uses under the hood. This matches what the upstream
+    // will actually charge, so Claude Code's context meter stays honest.
+    // (Previously we let Claude Code fall back to its Anthropic BPE, which
+    // over-estimates by 20-30% against OpenAI backends.)
     let api_routes = Router::new()
         .route("/v1/messages", post(create_message))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn(auth::auth_middleware))
         .layer(Extension(auth_key));
 
@@ -108,12 +112,19 @@ async fn create_message(
     // giving Claude Code accurate context window tracking.
     let estimated_input_tokens = crate::token_count::count_request_tokens(&request);
     let msg_count = request.messages.len();
+
+    // Build the canonical → original tool name map from the inbound request's
+    // `tools` array. Used by response/stream converters to restore tool names
+    // if the upstream provider mutates casing. See util::tool_name.
+    let tool_name_map = crate::util::tool_name::build_map(request.tools.as_deref());
+
     tracing::info!(
         model = %request.model,
         stream = ?request.stream,
         messages = msg_count,
         tiktoken_input = estimated_input_tokens,
         max_tokens = request.max_tokens,
+        tools = tool_name_map.len(),
         "→ request"
     );
 
@@ -139,6 +150,7 @@ async fn create_message(
             request.model.clone(),
             idle_timeout,
             estimated_input_tokens,
+            tool_name_map,
         );
 
         Ok(Sse::new(claude_stream)
@@ -159,56 +171,28 @@ async fn create_message(
             &openai_response,
             &request.model,
             estimated_input_tokens,
+            &tool_name_map,
         );
 
         Ok(Json(claude_response).into_response())
     }
 }
 
-#[allow(dead_code)]
+/// `/v1/messages/count_tokens` — pre-flight token estimate for Claude Code.
+///
+/// Claude Code calls this before sending the real request, to decide how
+/// much room is left in the context window. We answer with a tiktoken
+/// o200k_base count (same family used by OpenAI backends under the hood),
+/// so the estimate actually matches what the upstream will bill.
 async fn count_tokens(Json(request): Json<TokenCountRequest>) -> Json<serde_json::Value> {
-    let mut total_chars: usize = 0;
-
-    if let Some(ref system) = request.system {
-        match system {
-            SystemContent::Text(s) => total_chars += s.len(),
-            SystemContent::Blocks(blocks) => {
-                for b in blocks {
-                    if let Some(ref text) = b.text {
-                        total_chars += text.len();
-                    }
-                }
-            }
-        }
-    }
-
-    for msg in &request.messages {
-        match &msg.content {
-            MessageContent::Text(s) => total_chars += s.len(),
-            MessageContent::Blocks(blocks) => {
-                for block in blocks {
-                    if let crate::types::claude::ContentBlock::Text { text } = block {
-                        total_chars += text.len();
-                    }
-                }
-            }
-            MessageContent::Null => {}
-        }
-    }
-
-    // More accurate estimate: ~2.5 chars per token for mixed English/code content,
-    // plus overhead for message formatting (~4 tokens per message).
-    let msg_overhead = request.messages.len() * 4;
-    let estimated_tokens = ((total_chars as f64 / 2.5) as usize + msg_overhead).max(1);
-
+    let tokens = crate::token_count::count_token_count_request(&request);
     tracing::info!(
-        total_chars = total_chars,
         messages = request.messages.len(),
-        estimated_tokens = estimated_tokens,
+        has_tools = request.tools.is_some(),
+        tokens,
         "count_tokens"
     );
-
-    Json(serde_json::json!({ "input_tokens": estimated_tokens }))
+    Json(serde_json::json!({ "input_tokens": tokens }))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

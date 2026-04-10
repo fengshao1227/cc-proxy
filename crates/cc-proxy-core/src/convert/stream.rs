@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::types::claude::{sse, stop_reason, Usage};
 use crate::types::openai::ChatCompletionChunk;
+use crate::util::{tool_id, tool_name};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -53,10 +54,12 @@ pub enum StreamError {
 struct ToolCallAccumulator {
     /// OpenAI tool call ID (e.g. "call_abc123").
     id: Option<String>,
-    /// Function name.
+    /// Function name (already restored via tool_name::restore).
     name: Option<String>,
-    /// Accumulated raw JSON argument fragments (for debugging/logging only).
-    #[allow(dead_code)]
+    /// Accumulated raw JSON argument fragments from the upstream stream.
+    /// Emitted as a single repaired `input_json_delta` during epilogue so
+    /// providers that send non-standard JSON (single quotes etc.) round-trip
+    /// correctly. See `emit_epilogue` and `util::fix_json`.
     args_buffer: String,
     /// The Claude content-block index assigned to this tool call.
     claude_index: Option<usize>,
@@ -101,6 +104,10 @@ struct ConverterState<S> {
     /// Pre-computed Claude-equivalent input token estimate from original request chars.
     /// Used instead of upstream's inflated input_tokens.
     estimated_input_tokens: u32,
+    /// canonical → original tool name map built from the inbound Claude request.
+    /// Used to restore tool_use.name after upstream providers lowercase or
+    /// otherwise mutate it. See `util::tool_name`.
+    tool_name_map: tool_name::ToolNameMap,
 }
 
 #[derive(Debug, PartialEq)]
@@ -129,6 +136,7 @@ pub fn openai_stream_to_claude(
     original_model: String,
     idle_timeout: Duration,
     estimated_input_tokens: u32,
+    tool_name_map: tool_name::ToolNameMap,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> + Send {
     let message_id = generate_message_id();
 
@@ -144,6 +152,7 @@ pub fn openai_stream_to_claude(
         phase: Phase::Prologue,
         idle_timeout,
         estimated_input_tokens,
+        tool_name_map,
     };
 
     // We collect events into a VecDeque because a single upstream chunk can
@@ -322,10 +331,12 @@ fn process_chunk(
                     acc.id = Some(id.clone());
                 }
 
-                // Update function name if provided.
+                // Update function name if provided. Restore original casing
+                // from the canonical map so Claude Code's tool registry can
+                // find a match even if the upstream lowercased or prefixed it.
                 if let Some(ref func) = tc_delta.function {
                     if let Some(ref name) = func.name {
-                        acc.name = Some(name.clone());
+                        acc.name = Some(tool_name::restore(&state.tool_name_map, name));
                     }
                 }
 
@@ -337,12 +348,16 @@ fn process_chunk(
                         acc.claude_index = Some(claude_index);
                         acc.started = true;
 
+                        // Sanitize the upstream id: some OpenAI-compat providers
+                        // return ids with characters outside Claude's allowed
+                        // regex. See util::tool_id.
+                        let safe_id = tool_id::sanitize(id);
                         let data = json!({
                             "type": sse::CONTENT_BLOCK_START,
                             "index": claude_index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": id,
+                                "id": safe_id,
                                 "name": name,
                                 "input": {}
                             }
@@ -351,23 +366,19 @@ fn process_chunk(
                     }
                 }
 
-                // Accumulate function arguments and emit input_json_delta incrementally.
+                // Accumulate function arguments into the buffer. We used to
+                // forward each fragment as an incremental input_json_delta,
+                // but some OpenAI-compat providers emit non-standard JSON
+                // (single-quoted strings, etc.) that can't be repaired
+                // piecewise — fix_json needs to see the whole document.
+                //
+                // So we buffer until epilogue, then emit a single repaired
+                // input_json_delta containing the full arguments. Matches
+                // CPA's behavior for the same reason.
                 if let Some(ref func) = tc_delta.function {
                     if let Some(ref args_fragment) = func.arguments {
-                        if let Some(claude_idx) = acc.claude_index {
-                            if !args_fragment.is_empty() {
-                                acc.args_buffer.push_str(args_fragment);
-
-                                let data = json!({
-                                    "type": sse::CONTENT_BLOCK_DELTA,
-                                    "index": claude_idx,
-                                    "delta": {
-                                        "type": sse::DELTA_INPUT_JSON,
-                                        "partial_json": args_fragment
-                                    }
-                                });
-                                buf.push_back(make_sse(sse::CONTENT_BLOCK_DELTA, &data));
-                            }
+                        if acc.claude_index.is_some() && !args_fragment.is_empty() {
+                            acc.args_buffer.push_str(args_fragment);
                         }
                     }
                 }
@@ -401,7 +412,10 @@ fn emit_epilogue(state: &ConverterState<impl Stream>, buf: &mut std::collections
     });
     buf.push_back(make_sse(sse::CONTENT_BLOCK_STOP, &text_stop));
 
-    // 2. content_block_stop for each started tool call block.
+    // 2. For each started tool call: flush the accumulated arguments as a
+    //    single repaired input_json_delta, then content_block_stop.
+    //    fix_json repairs non-standard JSON (single quotes etc.) so Claude
+    //    Code receives valid JSON regardless of upstream formatting quirks.
     let mut tool_indices: Vec<usize> = state.tool_calls.keys().copied().collect();
     tool_indices.sort();
     let has_tool_calls = tool_indices.iter().any(|idx| state.tool_calls[idx].started);
@@ -409,6 +423,22 @@ fn emit_epilogue(state: &ConverterState<impl Stream>, buf: &mut std::collections
         let acc = &state.tool_calls[&idx];
         if acc.started {
             if let Some(claude_idx) = acc.claude_index {
+                // Flush accumulated tool arguments as a single input_json_delta.
+                // Empty args_buffer is fine — fix_json returns "" unchanged,
+                // and Claude's parser handles an empty partial_json.
+                if !acc.args_buffer.is_empty() {
+                    let repaired = crate::util::fix_json::fix_json(&acc.args_buffer);
+                    let delta = json!({
+                        "type": sse::CONTENT_BLOCK_DELTA,
+                        "index": claude_idx,
+                        "delta": {
+                            "type": sse::DELTA_INPUT_JSON,
+                            "partial_json": repaired
+                        }
+                    });
+                    buf.push_back(make_sse(sse::CONTENT_BLOCK_DELTA, &delta));
+                }
+
                 let tool_stop = json!({
                     "type": sse::CONTENT_BLOCK_STOP,
                     "index": claude_idx
@@ -426,29 +456,37 @@ fn emit_epilogue(state: &ConverterState<impl Stream>, buf: &mut std::collections
     };
 
     // 3. message_delta with stop_reason and usage.
-    // Use the MINIMUM of tiktoken estimate and upstream count.
-    // tiktoken counts the original content; upstream counts after format conversion.
-    // Taking the min avoids both over-reporting and under-reporting.
-    let report_input = if state.estimated_input_tokens > 0 && state.usage.input_tokens > 0 {
-        state.estimated_input_tokens.min(state.usage.input_tokens)
+    // Claude API semantics: input_tokens and cache_read_input_tokens are MUTUALLY
+    // EXCLUSIVE. input_tokens = fresh tokens, cache_read_input_tokens = from cache.
+    // Upstream reports prompt_tokens as the TOTAL (fresh + cached), so we must
+    // subtract cached before reporting.
+    //
+    // Algorithm adapted from CLIProxyAPI (MIT) — extractOpenAIUsage.
+    // Note: state.usage.input_tokens here was captured from upstream chunk.usage.prompt_tokens,
+    // and state.usage.cache_read_input_tokens from prompt_tokens_details.cached_tokens
+    // (see process_chunk). They are raw upstream numbers and must be normalized here.
+    let cached = state.usage.cache_read_input_tokens.unwrap_or(0);
+    let fresh_input = state.usage.input_tokens.saturating_sub(cached);
+    let report_input = if state.estimated_input_tokens > 0 && fresh_input > 0 {
+        state.estimated_input_tokens.min(fresh_input)
     } else if state.estimated_input_tokens > 0 {
         state.estimated_input_tokens
     } else {
-        state.usage.input_tokens
+        fresh_input
     };
     let report_output = state.usage.output_tokens;
-    // Preserve cache ratio from upstream.
-    let cache_ratio = if state.usage.input_tokens > 0 {
-        state.usage.cache_read_input_tokens.unwrap_or(0) as f64 / state.usage.input_tokens as f64
+    let usage_data = if cached > 0 {
+        json!({
+            "input_tokens": report_input,
+            "output_tokens": report_output,
+            "cache_read_input_tokens": cached
+        })
     } else {
-        0.0
+        json!({
+            "input_tokens": report_input,
+            "output_tokens": report_output
+        })
     };
-    let report_cache = (report_input as f64 * cache_ratio).round() as u32;
-    let usage_data = json!({
-        "input_tokens": report_input,
-        "output_tokens": report_output,
-        "cache_read_input_tokens": report_cache
-    });
     let message_delta = json!({
         "type": sse::MESSAGE_DELTA,
         "delta": {
@@ -529,7 +567,13 @@ mod tests {
         model: &str,
     ) -> Vec<Event> {
         let upstream = stream::iter(events);
-        let output = openai_stream_to_claude(upstream, model.to_string(), Duration::ZERO, 0);
+        let output = openai_stream_to_claude(
+            upstream,
+            model.to_string(),
+            Duration::ZERO,
+            0,
+            tool_name::ToolNameMap::new(),
+        );
         futures::pin_mut!(output);
         let mut results = Vec::new();
         while let Some(Ok(event)) = output.next().await {
@@ -641,14 +685,41 @@ mod tests {
 
         let result = collect_events(events, "claude-3-opus-20240229").await;
 
-        // Prologue(3) + content_block_start(tool) + 2 input_json_deltas (one per chunk) + finish(nothing)
-        // Epilogue: text_stop + tool_stop + message_delta + message_stop = 4
-        // Total = 3 + 1 (tool block start) + 2 (json deltas) + 4 = 10
+        // With buffered tool-args emission (see emit_epilogue):
+        //   Prologue(3): message_start + content_block_start(text) + ping
+        //   Streaming:   content_block_start(tool) only — args are buffered
+        //   Epilogue(5): text_stop + input_json_delta(merged) + tool_stop
+        //                + message_delta + message_stop
+        // Total = 3 + 1 + 5 = 9
         assert_eq!(
             result.len(),
-            10,
-            "expected 10 events for tool call stream, got {}",
+            9,
+            "expected 9 events for tool call stream, got {}",
             result.len()
+        );
+
+        // The merged input_json_delta must contain the full reassembled
+        // arguments. Find it in the event sequence and verify its payload.
+        let merged = result
+            .iter()
+            .find_map(|evt| {
+                // Debug-format the Event and fish the JSON payload out. The
+                // axum Event type doesn't expose its fields directly, but
+                // its Debug impl dumps `data: Some("...")`.
+                let s = format!("{:?}", evt);
+                if s.contains("input_json_delta") {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .expect("should find a merged input_json_delta event");
+        // Debug-format escapes quotes twice, so look for the unambiguous
+        // tail of the reassembled arguments instead.
+        assert!(
+            merged.contains("location") && merged.contains("SF"),
+            "merged partial_json should contain the reassembled args, got: {}",
+            merged
         );
     }
 
