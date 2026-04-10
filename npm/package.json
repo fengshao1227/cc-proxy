@@ -1,6 +1,6 @@
 {
   "name": "ccproxy-cli",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Claude Code Proxy - A high-performance proxy for Claude API, built with Rust",
   "bin": {
     "cc-proxy": "bin.js"

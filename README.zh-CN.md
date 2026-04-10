@@ -154,7 +154,7 @@ SMALL (haiku)  → gpt-5.4-mini 思考强度: none
 - `netstat` 看不到任何进程在监听
 - cc-proxy `/health` 探测自然也连不上 → 看起来"未运行"
 
-**一键永久修复**（v0.2.2+）：
+**一键永久修复**（v0.2.3+）：
 
 ```bash
 cc-proxy doctor --fix

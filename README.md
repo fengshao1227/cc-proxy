@@ -144,7 +144,7 @@ Real cause: on Windows, Hyper-V / WSL2 / Docker Desktop reserve a slice of TCP p
 - `netstat` shows nothing listening on the port
 - `cc-proxy /health` probe also fails → looks like "not running"
 
-**One-click permanent fix** (v0.2.2+):
+**One-click permanent fix** (v0.2.3+):
 
 ```bash
 cc-proxy doctor --fix
