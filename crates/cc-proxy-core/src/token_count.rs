@@ -7,8 +7,8 @@
 use tiktoken_rs::o200k_base;
 
 use crate::types::claude::{
-    ContentBlock, Message, MessageContent, MessagesRequest, SystemContent, TokenCountRequest,
-    Tool, ToolResultContent,
+    ContentBlock, Message, MessageContent, MessagesRequest, SystemContent, TokenCountRequest, Tool,
+    ToolResultContent,
 };
 
 /// Count input tokens for a Claude Messages API request using tiktoken BPE.
