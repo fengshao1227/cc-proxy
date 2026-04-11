@@ -158,9 +158,7 @@ pub struct ResponsesResponse {
 pub enum OutputItem {
     /// A text / tool-use message from the assistant.
     #[serde(rename = "message")]
-    Message {
-        content: Vec<ContentPart>,
-    },
+    Message { content: Vec<ContentPart> },
     /// A reasoning / thinking block.
     #[serde(rename = "reasoning")]
     Reasoning {
@@ -302,4 +300,3 @@ pub struct ResponseCompletedPayload {
     #[serde(default)]
     pub output: Vec<OutputItem>,
 }
-

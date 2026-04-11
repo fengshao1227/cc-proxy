@@ -165,11 +165,7 @@ impl MsgState {
 }
 
 /// Process one Claude message, appending items to `out`.
-fn process_message(
-    msg: &Message,
-    short_map: &HashMap<String, String>,
-    out: &mut Vec<InputItem>,
-) {
+fn process_message(msg: &Message, short_map: &HashMap<String, String>, out: &mut Vec<InputItem>) {
     let role = msg.role.as_str();
     let mut state = MsgState::new(role);
 
@@ -202,7 +198,9 @@ fn process_message(
                     .unwrap_or("application/octet-stream");
                 let data = source.data.as_deref().unwrap_or("");
                 let url = format!("data:{media_type};base64,{data}");
-                state.content.push(ContentPart::InputImage { image_url: url });
+                state
+                    .content
+                    .push(ContentPart::InputImage { image_url: url });
                 state.has_content = true;
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -215,8 +213,7 @@ fn process_message(
                     .cloned()
                     .unwrap_or_else(|| shorten_name_if_needed(name));
 
-                let arguments =
-                    serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
 
                 out.push(InputItem::FunctionCall(FunctionCallItem {
                     call_id: id.clone(),
@@ -281,10 +278,7 @@ fn tool_result_to_parts(content: Option<&ToolResultContent>) -> Vec<ContentPart>
                             .get("media_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("application/octet-stream");
-                        let data = source
-                            .get("data")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
                         let url = format!("data:{media_type};base64,{data}");
                         Some(ContentPart::InputImage { image_url: url })
                     }
@@ -392,8 +386,7 @@ pub fn normalize_tool_parameters(schema: &serde_json::Value) -> serde_json::Valu
     }
 
     // If type is "object" and "properties" is missing, add empty properties.
-    if obj.get("type").and_then(|v| v.as_str()) == Some("object")
-        && !obj.contains_key("properties")
+    if obj.get("type").and_then(|v| v.as_str()) == Some("object") && !obj.contains_key("properties")
     {
         obj.insert(
             "properties".into(),
@@ -521,7 +514,7 @@ pub fn shorten_name_if_needed(name: &str) -> String {
 pub fn build_tool_name_map(
     tools: Option<&[crate::types::claude::Tool]>,
 ) -> crate::util::tool_name::ToolNameMap {
-    use crate::util::tool_name::{canonical, build_map};
+    use crate::util::tool_name::{build_map, canonical};
 
     // Start with the standard canonical(original) → original entries.
     let mut map = build_map(tools);
@@ -953,7 +946,10 @@ mod tests {
         req.thinking = Some(ThinkingConfig { enabled: false });
 
         let result = claude_to_responses(&req, &config);
-        let r = result.reasoning.as_ref().expect("reasoning present even when none");
+        let r = result
+            .reasoning
+            .as_ref()
+            .expect("reasoning present even when none");
         assert_eq!(r.effort, "none");
     }
 
@@ -1091,8 +1087,7 @@ mod tests {
 
         // A tool whose full name is over 64 bytes → gets shortened via the
         // mcp__ shortcut path.
-        let long_name =
-            "mcp__extremely_long_namespace_prefix__very_descriptive_function_name";
+        let long_name = "mcp__extremely_long_namespace_prefix__very_descriptive_function_name";
         assert!(long_name.len() > TOOL_NAME_LIMIT);
 
         let tools = vec![Tool {
@@ -1160,6 +1155,8 @@ mod tests {
         let result = claude_to_responses(&req, &config);
         assert!(result.stream);
         assert!(!result.store);
-        assert!(result.include.contains(&"reasoning.encrypted_content".to_string()));
+        assert!(result
+            .include
+            .contains(&"reasoning.encrypted_content".to_string()));
     }
 }

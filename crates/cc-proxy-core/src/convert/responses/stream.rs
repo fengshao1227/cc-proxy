@@ -364,7 +364,11 @@ fn process_event(
                     output_tokens: u.output_tokens,
                     cache_read_input_tokens: {
                         let c = u.input_tokens_details.cached_tokens;
-                        if c > 0 { Some(c) } else { None }
+                        if c > 0 {
+                            Some(c)
+                        } else {
+                            None
+                        }
                     },
                 };
             }
@@ -413,10 +417,7 @@ fn emit_epilogue(state: &ConverterState<impl Stream>, buf: &mut VecDeque<Event>)
 
     warn!(
         "← responses stream done | input={} output={} cache={} stop={}",
-        report_input,
-        report_output,
-        cached,
-        final_stop,
+        report_input, report_output, cached, final_stop,
     );
 
     let message_delta = json!({
@@ -490,17 +491,15 @@ fn generate_message_id() -> String {
 mod tests {
     use super::*;
     use crate::types::responses::{
-        OutputItemAddedPayload, ResponseCompletedPayload, ResponseCreatedPayload,
-        ResponsesStreamEvent, ResponsesUsage, InputTokensDetails,
+        InputTokensDetails, OutputItemAddedPayload, ResponseCompletedPayload,
+        ResponseCreatedPayload, ResponsesStreamEvent, ResponsesUsage,
     };
     use futures::stream;
     use std::time::Duration;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    async fn collect(
-        events: Vec<Result<ResponsesStreamEvent, StreamError>>,
-    ) -> Vec<String> {
+    async fn collect(events: Vec<Result<ResponsesStreamEvent, StreamError>>) -> Vec<String> {
         let upstream = stream::iter(events);
         let out = responses_stream_to_claude(
             upstream,
@@ -553,8 +552,12 @@ mod tests {
         let events = vec![
             Ok(created_event()),
             Ok(ResponsesStreamEvent::ContentPartAdded {}),
-            Ok(ResponsesStreamEvent::OutputTextDelta { delta: "Hello ".into() }),
-            Ok(ResponsesStreamEvent::OutputTextDelta { delta: "world".into() }),
+            Ok(ResponsesStreamEvent::OutputTextDelta {
+                delta: "Hello ".into(),
+            }),
+            Ok(ResponsesStreamEvent::OutputTextDelta {
+                delta: "world".into(),
+            }),
             Ok(ResponsesStreamEvent::ContentPartDone {}),
             Ok(completed_event("end_turn")),
         ];
@@ -563,7 +566,13 @@ mod tests {
 
         // message_start(1) + block_start(1) + deltas(2) + block_stop(1)
         // + message_delta(1) + message_stop(1) = 7
-        assert_eq!(result.len(), 7, "expected 7 events, got {}: {:?}", result.len(), result);
+        assert_eq!(
+            result.len(),
+            7,
+            "expected 7 events, got {}: {:?}",
+            result.len(),
+            result
+        );
 
         assert!(has_pattern(&result, "message_start"));
         assert!(has_pattern(&result, "content_block_start"));
@@ -581,11 +590,15 @@ mod tests {
             Ok(created_event()),
             // Thinking block
             Ok(ResponsesStreamEvent::ReasoningSummaryPartAdded {}),
-            Ok(ResponsesStreamEvent::ReasoningSummaryTextDelta { delta: "Let me think".into() }),
+            Ok(ResponsesStreamEvent::ReasoningSummaryTextDelta {
+                delta: "Let me think".into(),
+            }),
             Ok(ResponsesStreamEvent::ReasoningSummaryPartDone {}),
             // Text block
             Ok(ResponsesStreamEvent::ContentPartAdded {}),
-            Ok(ResponsesStreamEvent::OutputTextDelta { delta: "Answer".into() }),
+            Ok(ResponsesStreamEvent::OutputTextDelta {
+                delta: "Answer".into(),
+            }),
             Ok(ResponsesStreamEvent::ContentPartDone {}),
             Ok(completed_event("end_turn")),
         ];
@@ -597,11 +610,18 @@ mod tests {
         // + text_block_stop(1) + message_delta(1) + message_stop(1) = 9
         assert_eq!(result.len(), 9, "got {}: {:?}", result.len(), result);
 
-        assert!(has_pattern(&result, "thinking_delta"), "should have thinking_delta");
+        assert!(
+            has_pattern(&result, "thinking_delta"),
+            "should have thinking_delta"
+        );
         assert!(has_pattern(&result, "text_delta"), "should have text_delta");
         // Both blocks should stop — there should be 2 content_block_stop events.
         assert!(
-            result.iter().filter(|s| s.contains("content_block_stop")).count() >= 2,
+            result
+                .iter()
+                .filter(|s| s.contains("content_block_stop"))
+                .count()
+                >= 2,
             "should have at least 2 content_block_stop"
         );
     }
@@ -641,12 +661,24 @@ mod tests {
         // + message_delta(1) + message_stop(1) = 7
         assert_eq!(result.len(), 7, "got {}: {:?}", result.len(), result);
 
-        assert!(has_pattern(&result, "tool_use"), "should have tool_use block_start");
-        assert!(has_pattern(&result, "input_json_delta"), "should have input_json_delta");
-        assert!(has_pattern(&result, "message_stop"), "should have message_stop");
+        assert!(
+            has_pattern(&result, "tool_use"),
+            "should have tool_use block_start"
+        );
+        assert!(
+            has_pattern(&result, "input_json_delta"),
+            "should have input_json_delta"
+        );
+        assert!(
+            has_pattern(&result, "message_stop"),
+            "should have message_stop"
+        );
 
         // stop_reason must be forced to tool_use
-        assert!(has_pattern(&result, "tool_use"), "stop_reason should be tool_use");
+        assert!(
+            has_pattern(&result, "tool_use"),
+            "stop_reason should be tool_use"
+        );
     }
 
     // ── test_multiple_tool_calls_stream ──────────────────────────────────

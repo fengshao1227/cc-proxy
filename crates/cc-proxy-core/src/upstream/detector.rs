@@ -66,16 +66,10 @@ pub async fn detect(
             return Ok(UpstreamApiMode::ChatCompletions);
         }
         Ok(false) => {
-            tracing::error!(
-                "❌ ChatCompletions also unreachable at {}",
-                chat_url
-            );
+            tracing::error!("❌ ChatCompletions also unreachable at {}", chat_url);
         }
         Err(e) => {
-            tracing::error!(
-                "❌ ChatCompletions probe error: {}",
-                e
-            );
+            tracing::error!("❌ ChatCompletions probe error: {}", e);
         }
     }
 
@@ -348,7 +342,10 @@ mod tests {
         let config = make_config(base);
         let client = plain_client();
         let result = detect(&config, &client).await;
-        assert!(result.is_err(), "expected error when both endpoints return 404");
+        assert!(
+            result.is_err(),
+            "expected error when both endpoints return 404"
+        );
     }
 
     /// Network error on Responses endpoint (unreachable port) → fall back to ChatCompletions.

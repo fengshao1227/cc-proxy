@@ -38,9 +38,7 @@ pub fn responses_to_claude(
                 for part in content {
                     if let ContentPart::OutputText { text } = part {
                         if !text.is_empty() {
-                            content_blocks.push(ResponseContentBlock::Text {
-                                text: text.clone(),
-                            });
+                            content_blocks.push(ResponseContentBlock::Text { text: text.clone() });
                         }
                     }
                 }
@@ -68,9 +66,8 @@ pub fn responses_to_claude(
                 let safe_id = tool_id::sanitize(call_id);
 
                 // Parse arguments with lenient fallback for non-standard JSON.
-                let input = fix_json::parse_lenient(arguments).unwrap_or_else(|_| {
-                    serde_json::json!({"raw_arguments": arguments})
-                });
+                let input = fix_json::parse_lenient(arguments)
+                    .unwrap_or_else(|_| serde_json::json!({"raw_arguments": arguments}));
 
                 content_blocks.push(ResponseContentBlock::ToolUse {
                     id: safe_id,
@@ -96,11 +93,7 @@ pub fn responses_to_claude(
     let stop_reason = if has_tool_call {
         claude::stop_reason::TOOL_USE.to_string()
     } else {
-        match response
-            .stop_reason
-            .as_deref()
-            .unwrap_or("")
-        {
+        match response.stop_reason.as_deref().unwrap_or("") {
             "max_tokens" => claude::stop_reason::MAX_TOKENS.to_string(),
             _ => claude::stop_reason::END_TURN.to_string(),
         }
@@ -313,10 +306,14 @@ mod tests {
 
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 2);
-        let names: Vec<_> = result.content.iter().filter_map(|b| match b {
-            ResponseContentBlock::ToolUse { name, .. } => Some(name.as_str()),
-            _ => None,
-        }).collect();
+        let names: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ResponseContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(names, vec!["search", "fetch"]);
     }
 
@@ -344,8 +341,14 @@ mod tests {
 
         assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(result.content.len(), 2);
-        assert!(matches!(&result.content[0], ResponseContentBlock::Text { .. }));
-        assert!(matches!(&result.content[1], ResponseContentBlock::ToolUse { .. }));
+        assert!(matches!(
+            &result.content[0],
+            ResponseContentBlock::Text { .. }
+        ));
+        assert!(matches!(
+            &result.content[1],
+            ResponseContentBlock::ToolUse { .. }
+        ));
     }
 
     // ---- test_usage_with_cache ----
@@ -436,7 +439,9 @@ mod tests {
     fn test_stop_reason_max_tokens() {
         let resp = make_response(
             vec![OutputItem::Message {
-                content: vec![ContentPart::OutputText { text: "truncated".into() }],
+                content: vec![ContentPart::OutputText {
+                    text: "truncated".into(),
+                }],
             }],
             Some("max_tokens"),
         );
