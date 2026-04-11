@@ -6,9 +6,24 @@
 //!
 //! # Event mapping (§3 §4 of the algo hand-book)
 //!
+//! # Stream prologue
+//!
+//! To avoid a 1-2 second "dead air" window between Claude Code seeing HTTP
+//! headers and receiving the first SSE byte, we emit a **synthetic**
+//! `message_start` at stream construction time — *before* the upstream has
+//! produced anything. The synthesized event uses the original Claude model
+//! name and a locally-generated message ID (`msg_<uuid_hex>`). When the real
+//! `response.created` event eventually arrives from upstream, we discard it
+//! (the prologue has already filled that slot). This mirrors how CPA's
+//! Go implementation flushes `message_start` immediately on its first
+//! `ResponseWriter.Flush()`.
+//!
+//! # Event mapping (§3 §4 of the algo hand-book)
+//!
 //! | Upstream event                          | Claude SSE output                         |
 //! |-----------------------------------------|-------------------------------------------|
-//! | `response.created`                      | `message_start`                           |
+//! | (stream construction)                   | synthetic `message_start` (prologue)      |
+//! | `response.created`                      | discarded (prologue already emitted)      |
 //! | `reasoning_summary_part.added`          | `content_block_start` (thinking)          |
 //! | `reasoning_summary_text.delta`          | `content_block_delta` (thinking_delta)    |
 //! | `reasoning_summary_part.done`           | `content_block_stop`, BlockIndex++        |
@@ -46,8 +61,7 @@ pub use crate::convert::stream::StreamError;
 
 #[derive(Debug, PartialEq)]
 enum Phase {
-    /// Waiting for the first upstream event (no prologue — message_start is
-    /// emitted in response to `response.created`).
+    /// Prologue already emitted at construction; now pulling upstream events.
     Streaming,
     /// Emit closing events.
     Epilogue,
@@ -112,67 +126,72 @@ pub fn responses_stream_to_claude(
         tool_name_map,
     };
 
-    futures::stream::unfold(
-        (state, VecDeque::<Event>::new()),
-        |(mut state, mut buf)| async move {
-            loop {
-                // Drain the output buffer before pulling more events.
-                if let Some(event) = buf.pop_front() {
-                    return Some((Ok(event), (state, buf)));
-                }
+    // Prologue: emit a synthetic `message_start` *before* the first upstream
+    // byte arrives. This kills the 1-2 s "dead air" gap Claude Code would
+    // otherwise see between headers and the first SSE event (the Responses
+    // upstream typically spends ~1.5 s on its reasoning prelude before
+    // yielding `response.created`).
+    let mut initial_buf = VecDeque::<Event>::new();
+    initial_buf.push_back(synth_message_start(&state.original_model));
 
-                match state.phase {
-                    Phase::Streaming => {
-                        let next = if state.idle_timeout.is_zero() {
-                            state.upstream.next().await
-                        } else {
-                            match timeout(state.idle_timeout, state.upstream.next()).await {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    error!(
-                                        "responses converter idle timeout ({}s)",
+    futures::stream::unfold((state, initial_buf), |(mut state, mut buf)| async move {
+        loop {
+            // Drain the output buffer before pulling more events.
+            if let Some(event) = buf.pop_front() {
+                return Some((Ok(event), (state, buf)));
+            }
+
+            match state.phase {
+                Phase::Streaming => {
+                    let next = if state.idle_timeout.is_zero() {
+                        state.upstream.next().await
+                    } else {
+                        match timeout(state.idle_timeout, state.upstream.next()).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                error!(
+                                    "responses converter idle timeout ({}s)",
+                                    state.idle_timeout.as_secs()
+                                );
+                                emit_error_event(
+                                    &format!(
+                                        "stream idle timeout ({}s)",
                                         state.idle_timeout.as_secs()
-                                    );
-                                    emit_error_event(
-                                        &format!(
-                                            "stream idle timeout ({}s)",
-                                            state.idle_timeout.as_secs()
-                                        ),
-                                        &mut buf,
-                                    );
-                                    state.phase = Phase::Epilogue;
-                                    continue;
-                                }
-                            }
-                        };
-
-                        match next {
-                            Some(Ok(event)) => {
-                                process_event(&mut state, event, &mut buf);
-                            }
-                            Some(Err(e)) => {
-                                error!("responses upstream error: {e}");
-                                emit_error_event(&e.to_string(), &mut buf);
+                                    ),
+                                    &mut buf,
+                                );
                                 state.phase = Phase::Epilogue;
-                            }
-                            None => {
-                                // Stream ended without response.completed.
-                                warn!("responses stream ended without completed event");
-                                state.phase = Phase::Epilogue;
+                                continue;
                             }
                         }
-                    }
-                    Phase::Epilogue => {
-                        emit_epilogue(&state, &mut buf);
-                        state.phase = Phase::Done;
-                    }
-                    Phase::Done => {
-                        return None;
+                    };
+
+                    match next {
+                        Some(Ok(event)) => {
+                            process_event(&mut state, event, &mut buf);
+                        }
+                        Some(Err(e)) => {
+                            error!("responses upstream error: {e}");
+                            emit_error_event(&e.to_string(), &mut buf);
+                            state.phase = Phase::Epilogue;
+                        }
+                        None => {
+                            // Stream ended without response.completed.
+                            warn!("responses stream ended without completed event");
+                            state.phase = Phase::Epilogue;
+                        }
                     }
                 }
+                Phase::Epilogue => {
+                    emit_epilogue(&state, &mut buf);
+                    state.phase = Phase::Done;
+                }
+                Phase::Done => {
+                    return None;
+                }
             }
-        },
-    )
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -185,26 +204,17 @@ fn process_event(
     buf: &mut VecDeque<Event>,
 ) {
     match event {
-        // ── response.created → message_start ──────────────────────────────
+        // ── response.created → discard ────────────────────────────────────
+        //
+        // The prologue already emitted a synthetic `message_start` at stream
+        // construction, so this upstream event is now informational only. We
+        // log the real upstream id for debugging/correlation but do not
+        // forward a second `message_start` to Claude Code.
         ResponsesStreamEvent::Created { response } => {
-            let data = json!({
-                "type": sse::MESSAGE_START,
-                "message": {
-                    "id": response.id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": state.original_model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0
-                    }
-                }
-            });
-            buf.push_back(make_sse(sse::MESSAGE_START, &data));
-            debug!("responses stream started id={}", response.id);
+            debug!(
+                "upstream response.created id={} (prologue already sent)",
+                response.id
+            );
         }
 
         // ── reasoning_summary_part.added → content_block_start (thinking) ─
@@ -473,14 +483,42 @@ fn emit_block_stop(index: usize, buf: &mut VecDeque<Event>) {
 
 /// Generate a Claude-style message ID: `msg_` + 24 hex characters.
 ///
-/// Kept as a fallback helper for when the upstream `response.created` event
-/// arrives without an `id` field — such providers shouldn't exist in theory
-/// but we've seen enough OpenAI-compat reinterpretations to keep this ready.
-/// Currently exercised by unit tests only.
-#[allow(dead_code)]
+/// Used by `synth_message_start` to stamp the prologue event with a locally-
+/// generated id (we can't wait for the upstream's real id — that would
+/// defeat the purpose of the prologue).
 fn generate_message_id() -> String {
     let uuid_hex = Uuid::new_v4().simple().to_string();
     format!("msg_{}", &uuid_hex[..24])
+}
+
+/// Build a synthetic `message_start` SSE event using the original Claude
+/// model name and a locally-generated message id.
+///
+/// Emitted at stream construction so Claude Code's first byte arrives
+/// immediately after headers, rather than waiting for the upstream's
+/// (often ~1.5 s) reasoning prelude before the real `response.created`.
+///
+/// `input_tokens: 0` / `output_tokens: 0` matches the shape the former
+/// Created-branch handler produced — the real counts land in the epilogue
+/// `message_delta` at the end of the stream.
+fn synth_message_start(model: &str) -> Event {
+    let data = json!({
+        "type": sse::MESSAGE_START,
+        "message": {
+            "id": generate_message_id(),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0
+            }
+        }
+    });
+    make_sse(sse::MESSAGE_START, &data)
 }
 
 // ---------------------------------------------------------------------------

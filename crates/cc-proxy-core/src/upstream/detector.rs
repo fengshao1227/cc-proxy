@@ -4,15 +4,26 @@ use crate::config::ProxyConfig;
 use crate::error::ProxyError;
 use crate::upstream::mode::UpstreamApiMode;
 
-/// Probe the upstream API type by trying Responses first, falling back to ChatCompletions.
+/// Probe the upstream API type by trying ChatCompletions first, falling back to Responses.
 ///
 /// Order of attempts:
-///   1. POST `<base>/responses` with a minimal body → if 200 or 4xx (non-404/405), use Responses
-///   2. POST `<base>/chat/completions` with a minimal body → if 200 or 4xx (non-404/405), use ChatCompletions
+///   1. POST `<base>/chat/completions` with a minimal body → if 200 or 4xx (non-404/405), use ChatCompletions
+///   2. POST `<base>/responses` with a minimal body → if 200 or 4xx (non-404/405), use Responses
 ///   3. If both fail (network error, 404, 405, 5xx) → return `ProxyError::Internal`
 ///
 /// Rationale: 4xx non-404/405 (e.g. 401 auth / 400 bad model / 403 rate limit) still prove
 /// the endpoint *exists*. Only 404 / 405 / network error / 5xx mean "endpoint unreachable".
+///
+/// # Why ChatCompletions is the default
+///
+/// Virtually every OpenAI-compatible relay implements `/v1/chat/completions`,
+/// and cc-proxy's ChatCompletions translator has been battle-tested for many
+/// releases. The Responses path is newer, and many relays (e.g. api.150226.xyz)
+/// accept the endpoint but subtly reject fields like `stream:false` or certain
+/// `reasoning.effort` values — producing confusing 500s at real-request time
+/// even though a probe might pass. Defaulting to ChatCompletions keeps the
+/// common case rock-solid; Responses is reserved for backends that *only*
+/// implement the new API.
 ///
 /// Each probe has a 10-second timeout; total worst-case is ~20 seconds.
 pub async fn detect(
@@ -20,36 +31,8 @@ pub async fn detect(
     client: &reqwest::Client,
 ) -> Result<UpstreamApiMode, ProxyError> {
     let base = config.openai_base_url.trim_end_matches('/');
-    let responses_url = format!("{}/responses", base);
     let chat_url = format!("{}/chat/completions", base);
-
-    tracing::info!("→ probing Responses API at {}", responses_url);
-
-    match try_endpoint(
-        client,
-        &responses_url,
-        responses_probe_body(&config.big_model),
-        &config.openai_api_key,
-    )
-    .await
-    {
-        Ok(true) => {
-            tracing::info!("✅ Responses API available, using Responses mode");
-            return Ok(UpstreamApiMode::Responses);
-        }
-        Ok(false) => {
-            tracing::warn!(
-                "❌ Responses API unreachable at {}, falling back to ChatCompletions",
-                responses_url
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "❌ Responses API probe returned unexpected error: {}, falling back to ChatCompletions",
-                e
-            );
-        }
-    }
+    let responses_url = format!("{}/responses", base);
 
     tracing::info!("→ probing ChatCompletions at {}", chat_url);
 
@@ -66,16 +49,44 @@ pub async fn detect(
             return Ok(UpstreamApiMode::ChatCompletions);
         }
         Ok(false) => {
-            tracing::error!("❌ ChatCompletions also unreachable at {}", chat_url);
+            tracing::warn!(
+                "❌ ChatCompletions unreachable at {}, falling back to Responses",
+                chat_url
+            );
         }
         Err(e) => {
-            tracing::error!("❌ ChatCompletions probe error: {}", e);
+            tracing::warn!(
+                "❌ ChatCompletions probe returned unexpected error: {}, falling back to Responses",
+                e
+            );
+        }
+    }
+
+    tracing::info!("→ probing Responses API at {}", responses_url);
+
+    match try_endpoint(
+        client,
+        &responses_url,
+        responses_probe_body(&config.big_model),
+        &config.openai_api_key,
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!("✅ Responses API available, using Responses mode");
+            return Ok(UpstreamApiMode::Responses);
+        }
+        Ok(false) => {
+            tracing::error!("❌ Responses API also unreachable at {}", responses_url);
+        }
+        Err(e) => {
+            tracing::error!("❌ Responses API probe error: {}", e);
         }
     }
 
     Err(ProxyError::Internal(format!(
-        "upstream does not support Responses API ({}/responses) or \
-         ChatCompletions API ({}/chat/completions) at this base URL — \
+        "upstream does not support ChatCompletions API ({}/chat/completions) or \
+         Responses API ({}/responses) at this base URL — \
          check OPENAI_BASE_URL and network connectivity",
         base, base
     )))
@@ -233,42 +244,43 @@ mod tests {
             .unwrap()
     }
 
-    // ── Responses endpoint tests ────────────────────────────────────────────
+    // ── Detection order tests ───────────────────────────────────────────────
+    //
+    // NOTE: as of the "ChatCompletions-first" refactor, detect() probes
+    // `/chat/completions` BEFORE `/responses`. A mock that returns the same
+    // status code on every path therefore yields `ChatCompletions` (the
+    // first probe wins). Fallback tests must force a real failure on the
+    // ChatCompletions path to reach the Responses fallback.
 
-    /// A 200 on the Responses endpoint → Responses mode.
+    /// A 200 on all paths → ChatCompletions mode (first probe wins).
     #[tokio::test]
-    async fn test_responses_200_returns_responses_mode() {
+    async fn test_all_200_returns_chat_mode() {
         let addr = mock_server(200).await;
         let base = format!("http://{}", addr);
         let config = make_config(base);
         let client = plain_client();
         let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::Responses);
+        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
     }
 
-    /// A 401 on the Responses endpoint (bad key) still proves the endpoint
-    /// exists → Responses mode.
+    /// A 401 on all paths (bad key) still proves the ChatCompletions
+    /// endpoint exists → ChatCompletions mode.
     #[tokio::test]
-    async fn test_responses_401_still_returns_responses_mode() {
+    async fn test_all_401_still_returns_chat_mode() {
         let addr = mock_server(401).await;
         let base = format!("http://{}", addr);
         let config = make_config(base);
         let client = plain_client();
         let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::Responses);
+        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
     }
 
-    /// A 404 on the Responses endpoint and a 200 on the ChatCompletions
-    /// fallback → ChatCompletions mode.
+    /// 404 on `/chat/completions` and 200 on `/responses` → Responses mode.
     ///
-    /// Because we only have one mock server returning a fixed status, we
-    /// test this by pointing the base URL at two *different* servers:
-    /// one returning 404 (for `/responses`) and one returning 200 (for
-    /// `/chat/completions`).  We achieve this by using a router mock that
-    /// inspects the request path.
+    /// This is the legacy "Responses-only backend" case and must keep
+    /// working after the probe order flip.
     #[tokio::test]
-    async fn test_responses_404_falls_back_to_chat_completions() {
-        // Serve 404 for /responses and 200 for /chat/completions.
+    async fn test_chat_404_falls_back_to_responses() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -276,8 +288,7 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                // Determine status from request line
-                let status = if req.contains("POST /responses") {
+                let status = if req.contains("POST /chat/completions") {
                     404u16
                 } else {
                     200u16
@@ -297,41 +308,7 @@ mod tests {
         let config = make_config(base);
         let client = plain_client();
         let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
-    }
-
-    /// Alias name: 404 on responses + 200 on chat → ChatCompletions.
-    #[tokio::test]
-    async fn test_responses_404_chat_200_returns_chat_mode() {
-        // Same as above — this test uses its own listener.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let status = if req.contains("POST /responses") {
-                    404u16
-                } else {
-                    200u16
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Status\r\n\
-                     Content-Length: 2\r\n\
-                     Content-Type: application/json\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {{}}"
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        let base = format!("http://{}", addr);
-        let config = make_config(base);
-        let client = plain_client();
-        let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
+        assert_eq!(mode, UpstreamApiMode::Responses);
     }
 
     /// Both endpoints return 404 → error.
@@ -348,13 +325,10 @@ mod tests {
         );
     }
 
-    /// Network error on Responses endpoint (unreachable port) → fall back to ChatCompletions.
-    /// We serve ChatCompletions on a real listener, while Responses points to /dev/null
-    /// by using a path-routing mock.
+    /// Network error on `/chat/completions` (connection dropped) and 200 on
+    /// `/responses` → fall back to Responses.
     #[tokio::test]
-    async fn test_responses_network_error_falls_back() {
-        // Use a listener that closes the connection immediately for /responses,
-        // and returns 200 for /chat/completions.
+    async fn test_chat_network_error_falls_back_to_responses() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -362,7 +336,7 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                if req.contains("POST /responses") {
+                if req.contains("POST /chat/completions") {
                     // Simulate connection drop — just close immediately.
                     drop(stream);
                 } else {
@@ -380,12 +354,13 @@ mod tests {
         let config = make_config(base);
         let client = plain_client();
         let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
+        assert_eq!(mode, UpstreamApiMode::Responses);
     }
 
-    /// 5xx on Responses → fall back; 200 on ChatCompletions → ChatCompletions mode.
+    /// 5xx on `/chat/completions` and 200 on `/responses` → fall back to
+    /// Responses (5xx is treated as "endpoint unreliable").
     #[tokio::test]
-    async fn test_responses_5xx_falls_back() {
+    async fn test_chat_5xx_falls_back_to_responses() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -393,7 +368,7 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let status = if req.contains("POST /responses") {
+                let status = if req.contains("POST /chat/completions") {
                     500u16
                 } else {
                     200u16
@@ -413,6 +388,6 @@ mod tests {
         let config = make_config(base);
         let client = plain_client();
         let mode = detect(&config, &client).await.unwrap();
-        assert_eq!(mode, UpstreamApiMode::ChatCompletions);
+        assert_eq!(mode, UpstreamApiMode::Responses);
     }
 }
