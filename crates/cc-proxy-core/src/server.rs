@@ -17,12 +17,15 @@ use crate::config::ProxyConfig;
 use crate::convert;
 use crate::error::ProxyError;
 use crate::types::claude::{MessagesRequest, TokenCountRequest};
+use crate::upstream;
 
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
     pub config: ProxyConfig,
     pub client: UpstreamClient,
+    /// Upstream API protocol detected at startup.
+    pub api_mode: upstream::mode::UpstreamApiMode,
 }
 
 /// Create the axum router
@@ -69,11 +72,17 @@ pub fn create_router(state: AppState) -> Router {
 /// Start the proxy server
 pub async fn serve(config: ProxyConfig) -> Result<(), ProxyError> {
     let client = UpstreamClient::new(&config)?;
+
+    // Probe the upstream to determine which API protocol to use.
+    let api_mode = upstream::detector::detect(&config, client.inner_client()).await?;
+    tracing::info!("upstream API mode: {}", api_mode.as_str());
+
     let addr = format!("{}:{}", config.host, config.port);
 
     let state = AppState {
         config: config.clone(),
         client,
+        api_mode,
     };
 
     let app = create_router(state);
@@ -115,8 +124,20 @@ async fn create_message(
 
     // Build the canonical → original tool name map from the inbound request's
     // `tools` array. Used by response/stream converters to restore tool names
-    // if the upstream provider mutates casing. See util::tool_name.
-    let tool_name_map = crate::util::tool_name::build_map(request.tools.as_deref());
+    // if the upstream provider mutates casing.
+    //
+    // For the Responses path we also register the **shortened** aliases that
+    // `claude_to_responses` will apply to over-64-byte tool names, so name
+    // restoration works when the upstream echoes back the short form.
+    // See convert::responses::request::build_tool_name_map.
+    let tool_name_map = match state.api_mode {
+        upstream::mode::UpstreamApiMode::Responses => {
+            convert::responses::request::build_tool_name_map(request.tools.as_deref())
+        }
+        upstream::mode::UpstreamApiMode::ChatCompletions => {
+            crate::util::tool_name::build_map(request.tools.as_deref())
+        }
+    };
 
     tracing::info!(
         model = %request.model,
@@ -128,53 +149,110 @@ async fn create_message(
         "→ request"
     );
 
-    let openai_request = convert::request::claude_to_openai(&request, &state.config);
+    let first_byte_timeout = Duration::from_secs(state.config.streaming_first_byte_timeout);
+    let idle_timeout = Duration::from_secs(state.config.streaming_idle_timeout);
+    let is_stream = request.stream.unwrap_or(false);
 
-    if request.stream.unwrap_or(false) {
-        // Streaming response — with per-chunk timeout protection
-        let first_byte_timeout = Duration::from_secs(state.config.streaming_first_byte_timeout);
-        let idle_timeout = Duration::from_secs(state.config.streaming_idle_timeout);
+    match state.api_mode {
+        upstream::mode::UpstreamApiMode::Responses => {
+            let responses_request =
+                convert::responses::request::claude_to_responses(&request, &state.config);
 
-        let event_stream = state
-            .client
-            .chat_completion_stream(
-                &openai_request,
-                &state.config.openai_api_key,
-                first_byte_timeout,
-                idle_timeout,
-            )
-            .await?;
+            if is_stream {
+                let event_stream = state
+                    .client
+                    .responses_completion_stream(
+                        &responses_request,
+                        &state.config.openai_api_key,
+                        first_byte_timeout,
+                        idle_timeout,
+                    )
+                    .await?;
 
-        let claude_stream = convert::stream::openai_stream_to_claude(
-            event_stream,
-            request.model.clone(),
-            idle_timeout,
-            estimated_input_tokens,
-            tool_name_map,
-        );
+                let claude_stream = convert::responses::stream::responses_stream_to_claude(
+                    event_stream,
+                    request.model.clone(),
+                    idle_timeout,
+                    estimated_input_tokens,
+                    tool_name_map,
+                );
 
-        Ok(Sse::new(claude_stream)
-            .keep_alive(
-                axum::response::sse::KeepAlive::new()
-                    .interval(std::time::Duration::from_secs(15))
-                    .text("ping"),
-            )
-            .into_response())
-    } else {
-        // Non-streaming response
-        let openai_response = state
-            .client
-            .chat_completion(&openai_request, &state.config.openai_api_key)
-            .await?;
+                Ok(Sse::new(claude_stream)
+                    .keep_alive(
+                        axum::response::sse::KeepAlive::new()
+                            .interval(std::time::Duration::from_secs(15))
+                            .text("ping"),
+                    )
+                    .into_response())
+            } else {
+                let responses_response = state
+                    .client
+                    .responses_completion(
+                        &responses_request,
+                        &state.config.openai_api_key,
+                        first_byte_timeout,
+                        idle_timeout,
+                    )
+                    .await?;
 
-        let claude_response = convert::response::openai_to_claude(
-            &openai_response,
-            &request.model,
-            estimated_input_tokens,
-            &tool_name_map,
-        );
+                let claude_response = convert::responses::response::responses_to_claude(
+                    &responses_response,
+                    &request.model,
+                    estimated_input_tokens,
+                    &tool_name_map,
+                );
 
-        Ok(Json(claude_response).into_response())
+                Ok(Json(claude_response).into_response())
+            }
+        }
+
+        upstream::mode::UpstreamApiMode::ChatCompletions => {
+            let openai_request = convert::request::claude_to_openai(&request, &state.config);
+
+            if is_stream {
+                // Streaming response — with per-chunk timeout protection
+                let event_stream = state
+                    .client
+                    .chat_completion_stream(
+                        &openai_request,
+                        &state.config.openai_api_key,
+                        first_byte_timeout,
+                        idle_timeout,
+                    )
+                    .await?;
+
+                let claude_stream = convert::stream::openai_stream_to_claude(
+                    event_stream,
+                    request.model.clone(),
+                    idle_timeout,
+                    estimated_input_tokens,
+                    tool_name_map,
+                );
+
+                Ok(Sse::new(claude_stream)
+                    .keep_alive(
+                        axum::response::sse::KeepAlive::new()
+                            .interval(std::time::Duration::from_secs(15))
+                            .text("ping"),
+                    )
+                    .into_response())
+            } else {
+                // Non-streaming response
+                let openai_response = state
+                    .client
+                    .chat_completion(&openai_request, &state.config.openai_api_key)
+                    .await?;
+
+                let claude_response = convert::response::openai_to_claude(
+                    &openai_response,
+                    &request.model,
+                    estimated_input_tokens,
+                    &tool_name_map,
+                );
+
+                Ok(Json(claude_response).into_response())
+            }
+        }
     }
 }
 

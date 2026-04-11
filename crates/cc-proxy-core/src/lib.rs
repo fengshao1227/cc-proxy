@@ -7,4 +7,5 @@ pub mod model_map;
 pub mod server;
 pub mod token_count;
 pub mod types;
+pub mod upstream;
 pub mod util;
