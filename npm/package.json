@@ -1,0 +1,42 @@
+{
+  "name": "ccproxy-cli",
+  "version": "0.4.5",
+  "description": "Claude Code Proxy - A high-performance proxy for Claude API, built with Rust",
+  "bin": {
+    "cc-proxy": "bin.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin.js",
+    "install.js",
+    "README.md"
+  ],
+  "keywords": [
+    "claude",
+    "proxy",
+    "api",
+    "anthropic",
+    "claude-code"
+  ],
+  "author": "fengshao1227",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fengshao1227/cc-proxy"
+  },
+  "homepage": "https://github.com/fengshao1227/cc-proxy#readme",
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

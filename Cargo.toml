@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cc-proxy-core",
+    "crates/cc-proxy-cli",
+]
+
+[workspace.package]
+version = "0.4.5"
+edition = "2021"
+authors = ["fengshao1227"]
+license = "MIT"
+repository = "https://github.com/fengshao1227/cc-proxy"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async utilities
+futures = "0.3"
+tokio-stream = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Stream utilities
+async-stream = "0.3"
+bytes = "1"
+
+# Home directory
+dirs = "5"
+
+# Token counting (BPE tokenizer, same as OpenAI tiktoken)
+tiktoken-rs = "0.9"
+
+# TUI interactive prompts
+dialoguer = "0.11"
+console = "0.15"
+
+# Unix process management
+libc = "0.2"
